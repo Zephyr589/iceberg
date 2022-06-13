@@ -29,6 +29,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -37,6 +38,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.MetadataTableType;
+import org.apache.iceberg.MetadataTableUtils;
 import org.apache.iceberg.MetadataUpdate;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -72,6 +75,7 @@ import org.apache.iceberg.rest.responses.ListTablesResponse;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.rest.responses.OAuthTokenResponse;
 import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
+import org.apache.iceberg.util.EnvironmentUtil;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.ThreadPools;
@@ -80,7 +84,7 @@ import org.slf4j.LoggerFactory;
 
 public class RESTSessionCatalog extends BaseSessionCatalog implements Configurable<Configuration>, Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(RESTSessionCatalog.class);
-  private static final long MAX_REFRESH_WINDOW_MILLIS = 60_000; // 1 minute
+  private static final long MAX_REFRESH_WINDOW_MILLIS = 300_000; // 5 minutes
   private static final long MIN_REFRESH_WAIT_MILLIS = 10;
   private static final List<String> TOKEN_PREFERENCE_ORDER = ImmutableList.of(
       OAuth2Properties.ID_TOKEN_TYPE, OAuth2Properties.ACCESS_TOKEN_TYPE, OAuth2Properties.JWT_TOKEN_TYPE,
@@ -107,8 +111,11 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
   }
 
   @Override
-  public void initialize(String name, Map<String, String> props) {
-    Preconditions.checkArgument(props != null, "Invalid configuration: null");
+  public void initialize(String name, Map<String, String> unresolved) {
+    Preconditions.checkArgument(unresolved != null, "Invalid configuration: null");
+    // resolve any configuration that is supplied by environment variables
+    // note that this is only done for local config properties and not for properties from the catalog service
+    Map<String, String> props = EnvironmentUtil.resolveAll(unresolved);
 
     long startTimeMillis = System.currentTimeMillis(); // keep track of the init start time for token refresh
     String initToken = props.get(OAuth2Properties.TOKEN);
@@ -207,12 +214,40 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
 
   @Override
   public Table loadTable(SessionContext context, TableIdentifier identifier) {
-    LoadTableResponse response = loadInternal(context, identifier);
+    MetadataTableType metadataType;
+    LoadTableResponse response;
+    try {
+      response = loadInternal(context, identifier);
+      metadataType = null;
+
+    } catch (NoSuchTableException original) {
+      metadataType = MetadataTableType.from(identifier.name());
+      if (metadataType != null) {
+        // attempt to load a metadata table using the identifier's namespace as the base table
+        TableIdentifier baseIdent = TableIdentifier.of(identifier.namespace().levels());
+        try {
+          response = loadInternal(context, baseIdent);
+        } catch (NoSuchTableException ignored) {
+          // the base table does not exist
+          throw original;
+        }
+      } else {
+        // name is not a metadata table
+        throw original;
+      }
+    }
+
     Pair<RESTClient, FileIO> clients = tableClients(response.config());
     AuthSession session = tableSession(response.config(), session(context));
     RESTTableOperations ops = new RESTTableOperations(
         clients.first(), paths.table(identifier), session::headers, clients.second(), response.tableMetadata());
-    return new BaseTable(ops, fullTableName(identifier));
+
+    BaseTable table = new BaseTable(ops, fullTableName(identifier));
+    if (metadataType != null) {
+      return MetadataTableUtils.createMetadataTableInstance(table, metadataType);
+    }
+
+    return table;
   }
 
   @Override
@@ -244,10 +279,17 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
 
   @Override
   public List<Namespace> listNamespaces(SessionContext context, Namespace namespace) {
-    Preconditions.checkArgument(namespace.isEmpty(), "Cannot list namespaces under parent: %s", namespace);
-    // String joined = NULL.join(namespace.levels());
-    ListNamespacesResponse response = client
-        .get(paths.namespaces(), ListNamespacesResponse.class, headers(context), ErrorHandlers.namespaceErrorHandler());
+    Map<String, String> queryParams;
+    if (namespace.isEmpty()) {
+      queryParams = ImmutableMap.of();
+    } else {
+      // query params should be unescaped
+      queryParams = ImmutableMap.of("parent", RESTUtil.NAMESPACE_JOINER.join(namespace.levels()));
+    }
+
+    ListNamespacesResponse response = client.get(
+        paths.namespaces(), queryParams, ListNamespacesResponse.class, headers(context),
+        ErrorHandlers.namespaceErrorHandler());
     return response.namespaces();
   }
 
@@ -322,13 +364,24 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
 
   @Override
   public void close() throws IOException {
+    shutdownRefreshExecutor();
+
     if (client != null) {
       client.close();
     }
+  }
 
+  private void shutdownRefreshExecutor() {
     if (refreshExecutor != null) {
       ScheduledExecutorService service = refreshExecutor;
       this.refreshExecutor = null;
+
+      List<Runnable> tasks = service.shutdownNow();
+      tasks.forEach(task -> {
+        if (task instanceof Future) {
+          ((Future<?>) task).cancel(true);
+        }
+      });
 
       try {
         if (service.awaitTermination(1, TimeUnit.MINUTES)) {

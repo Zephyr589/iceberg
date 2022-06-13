@@ -19,12 +19,16 @@ from __future__ import annotations
 
 from abc import ABC
 
+from iceberg.catalog.base import Identifier
+
 
 class Table(ABC):
     """Placeholder for Table managed by the Catalog that points to the current Table Metadata.
 
     To be implemented by https://github.com/apache/iceberg/issues/3227
     """
+
+    identifier: str | Identifier
 
 
 class PartitionSpec:
